@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -84,9 +85,15 @@ func (a *App) Run(ctx context.Context) error {
 
 	lastCommitDate := a.lastCommitDate(repo)
 
-	projectCommitCounter := make(map[int64]int, maxProjects)
+	// First, collect all commits from all projects into a single list
+	allCommits := []struct {
+		Commit    *Commit
+		ProjectID int64
+	}{}
 	projectID := int64(0)
 	page := int64(1)
+
+	a.logger.Printf("Collecting all commits from all projects...")
 
 	for page > 0 {
 		projects, nextPage, errFetch := a.gitlab.FetchProjectPage(ctx, page, currentUser, projectID)
@@ -95,16 +102,70 @@ func (a *App) Run(ctx context.Context) error {
 		}
 
 		for _, project := range projects {
-			commits, errCommit := a.doCommitsForProject(ctx, worktree, currentUser, project, lastCommitDate)
+			commits, errCommit := a.gitlab.FetchCommits(ctx, currentUser, project, lastCommitDate)
 			if errCommit != nil {
-				return fmt.Errorf("do commits: %w", errCommit)
+				return fmt.Errorf("fetch commits for project %d: %w", project, errCommit)
 			}
 
-			projectCommitCounter[projectID] = commits
+			if len(commits) > 0 {
+				for _, commit := range commits {
+					allCommits = append(allCommits, struct {
+						Commit    *Commit
+						ProjectID int64
+					}{
+						Commit:    commit,
+						ProjectID: project,
+					})
+				}
+				a.logger.Printf("Collected %d commits from project %d", len(commits), project)
+			}
 		}
 
 		page = nextPage
 	}
+
+	// Sort ALL commits by timestamp (oldest first)
+	// Use stable sort with secondary key (ProjectID) for deterministic ordering
+	sort.SliceStable(allCommits, func(i, j int) bool {
+		commitI := allCommits[i].Commit.CommittedAt
+		commitJ := allCommits[j].Commit.CommittedAt
+
+		if commitI.Equal(commitJ) {
+			// Use ProjectID as tiebreaker for stable ordering
+			return allCommits[i].ProjectID < allCommits[j].ProjectID
+		}
+		return commitI.Before(commitJ)
+	})
+
+	// Adjust duplicate timestamps to ensure uniqueness
+	// This fixes GitHub's commit-activity statistics API
+	duplicateCount := 0
+	for i := 1; i < len(allCommits); i++ {
+		prevTime := allCommits[i-1].Commit.CommittedAt
+		currTime := allCommits[i].Commit.CommittedAt
+
+		if !currTime.After(prevTime) {
+			// Add 1 second to make it unique and maintain chronological order
+			allCommits[i].Commit.CommittedAt = prevTime.Add(1 * time.Second)
+			duplicateCount++
+		}
+	}
+
+	if duplicateCount > 0 {
+		a.logger.Printf("Adjusted %d duplicate timestamps by adding 1-second increments", duplicateCount)
+	}
+
+	a.logger.Printf("Processing %d commits in strict chronological order...", len(allCommits))
+
+	// Apply commits one by one in chronological order
+	projectCommitCounter := make(map[int64]int, maxProjects)
+
+	commitCount, errCommit := a.applyAllCommits(ctx, worktree, allCommits, projectCommitCounter)
+	if errCommit != nil {
+		return fmt.Errorf("apply commits: %w", errCommit)
+	}
+
+	a.logger.Printf("Applied %d total commits", commitCount)
 
 	for project, commit := range projectCommitCounter {
 		a.logger.Printf("project %d: commits %d", project, commit)
@@ -166,38 +227,66 @@ func (a *App) lastCommitDate(repo *git.Repository) time.Time {
 	return lastCommitDate
 }
 
-func (a *App) doCommitsForProject(
-	ctx context.Context, worktree *git.Worktree, currentUser *User, projectID int64, lastCommitDate time.Time,
+func (a *App) applyAllCommits(
+	ctx context.Context, worktree *git.Worktree, allCommits []struct {
+		Commit    *Commit
+		ProjectID int64
+	}, projectCommitCounter map[int64]int,
 ) (int, error) {
-	commits, err := a.gitlab.FetchCommits(ctx, currentUser, projectID, lastCommitDate)
-	if err != nil {
-		return 0, fmt.Errorf("fetch commits: %w", err)
-	}
+	a.logger.Printf("Applying %d commits in chronological order", len(allCommits))
 
-	a.logger.Printf("Fetched %d commits for project %d", len(commits), projectID)
-
-	var commitCounter int
+	var totalCommitCounter int
 
 	committer := &object.Signature{
 		Name:  a.committerName,
 		Email: a.committerEmail,
 	}
 
-	for _, commit := range commits {
+	for _, commitWithProject := range allCommits {
+		commit := commitWithProject.Commit
+		projectID := commitWithProject.ProjectID
+
 		committer.When = commit.CommittedAt
+
+		// Track per-project commit counter
+		projectCounter := projectCommitCounter[projectID]
+
+		// Create a file with commit message to ensure non-empty commit
+		filename := fmt.Sprintf("commits/%d-%d.txt", projectID, projectCounter)
+		err := worktree.Filesystem.MkdirAll("commits", 0755)
+		if err != nil {
+			return totalCommitCounter, fmt.Errorf("create commits dir: %w", err)
+		}
+
+		file, err := worktree.Filesystem.Create(filename)
+		if err != nil {
+			return totalCommitCounter, fmt.Errorf("create file: %w", err)
+		}
+		_, err = file.Write([]byte(commit.Message + "\n"))
+		if err != nil {
+			file.Close()
+			return totalCommitCounter, fmt.Errorf("write file: %w", err)
+		}
+		file.Close()
+
+		_, err = worktree.Add(filename)
+		if err != nil {
+			return totalCommitCounter, fmt.Errorf("add file: %w", err)
+		}
 
 		if _, errCommit := worktree.Commit(commit.Message, &git.CommitOptions{
 			Author:            committer,
 			Committer:         committer,
-			AllowEmptyCommits: true,
+			AllowEmptyCommits: false,
 		}); errCommit != nil {
-			return commitCounter, fmt.Errorf("commit: %w", errCommit)
+			return totalCommitCounter, fmt.Errorf("commit: %w", errCommit)
 		}
 
-		commitCounter++
+		totalCommitCounter++
+		projectCommitCounter[projectID]++
 	}
 
-	return commitCounter, nil
+	return totalCommitCounter, nil
 }
 
 // repoName generates unique repo name for the user.
