@@ -165,6 +165,7 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("apply commits: %w", errCommit)
 	}
 
+
 	a.logger.Printf("Applied %d total commits", commitCount)
 
 	for project, commit := range projectCommitCounter {
